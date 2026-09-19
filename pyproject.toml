@@ -1,0 +1,27 @@
+[project]
+name = "jev-rerank"
+version = "0.1.0"
+description = "Fast, disk-backed document retrieval and TypeSafe semantic reranking"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["typesafe-sdk>=0.5.7,<0.6"]
+
+[project.scripts]
+jev-rerank = "jev_rerank.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=1", "ruff>=0.12"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[build-system]
+requires = ["uv_build>=0.9.3,<0.10.0"]
+build-backend = "uv_build"

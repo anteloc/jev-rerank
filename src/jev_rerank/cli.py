@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import math
+import os
+import sqlite3
+import sys
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+from typesafe_sdk import AsyncTypeSafeClient, RetryPolicy, TypeSafeError
+
+from .index import Index
+from .rerank import DEFAULT_MODEL, RankingStats, RerankError, rerank
+
+
+def positive(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def nonnegative(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or a positive integer")
+    return number
+
+
+def timeout_value(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return number
+
+
+def cache_directory() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME")
+    return (Path(base) if base else Path.home() / ".cache") / "jev-rerank"
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Find text files using BM25 retrieval and TypeSafe reranking.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    result.add_argument("--docs", required=True, type=Path, help="Text files directory")
+    result.add_argument(
+        "--query", required=True, help="What the best documents should match"
+    )
+    result.add_argument(
+        "--top", required=True, type=positive, help="Number of files to return"
+    )
+    result.add_argument(
+        "--candidates",
+        type=nonnegative,
+        help="Shortlist size (default: max(100, 10 * top)); 0 scores every passage",
+    )
+    result.add_argument(
+        "--concurrency", type=positive, default=16, help="Maximum in-flight requests"
+    )
+    result.add_argument(
+        "--model",
+        default=os.environ.get("TYPESAFE_DEFAULT_MODEL") or DEFAULT_MODEL,
+        help="TypeSafe model ID; pin a version for reproducible cached results",
+    )
+    result.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=cache_directory(),
+        help="Directory for the persistent text index and score cache",
+    )
+    result.add_argument(
+        "--chunk-chars",
+        type=positive,
+        default=4000,
+        help="Characters per passage, with 10%% overlap (maximum 400 characters)",
+    )
+    result.add_argument(
+        "--timeout",
+        type=timeout_value,
+        default=60.0,
+        help="SDK request timeout in seconds",
+    )
+    result.add_argument(
+        "--retries",
+        type=nonnegative,
+        default=4,
+        help="Retries for transient API failures",
+    )
+    result.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Reread all files, even if metadata is unchanged",
+    )
+    result.add_argument(
+        "--no-score-cache",
+        action="store_true",
+        help="Do not read or write cached scores",
+    )
+    result.add_argument(
+        "--json", action="store_true", help="Write structured JSON to stdout"
+    )
+    result.add_argument(
+        "--quiet", action="store_true", help="Hide progress; still report warnings"
+    )
+    return result
+
+
+async def run(args: argparse.Namespace) -> int:
+    start = time.monotonic()
+    root = args.docs.expanduser().resolve()
+    candidates = args.candidates
+    if candidates is None:
+        candidates = max(100, 10 * args.top)
+    cache_dir = args.cache_dir.expanduser().resolve()
+    # A separate index per root and chunking configuration avoids accidental
+    # corpus mixing and lets different passage sizes coexist.
+    identity = hashlib.sha256(f"{root}\0{args.chunk_chars}".encode()).hexdigest()[:24]
+    database = cache_dir / f"{identity}.sqlite3"
+
+    def status(message: str) -> None:
+        if not args.quiet:
+            print(message, file=sys.stderr, flush=True)
+
+    def warning(message: str) -> None:
+        print(f"Warning: {message}", file=sys.stderr, flush=True)
+
+    index = Index(database, root, args.chunk_chars)
+    try:
+        status(f"Refreshing index for {root} ...")
+        indexed = index.sync(warning, rebuild=args.rebuild)
+        status(
+            f"Indexed {indexed.documents:,} files / {indexed.passages:,} passages "
+            f"({indexed.updated:,} updated, {indexed.skipped:,} skipped, "
+            f"{indexed.removed:,} removed)."
+        )
+        exhaustive = candidates == 0 or indexed.documents <= candidates
+        if exhaustive:
+            status(f"Scoring all {indexed.passages:,} passages with TypeSafe ...")
+        else:
+            status(
+                f"Reranking up to {candidates:,} files from a BM25 shortlist "
+                "(one matching passage per file); --candidates 0 scores everything."
+            )
+        last_progress = time.monotonic()
+
+        def progress(stats: RankingStats) -> None:
+            nonlocal last_progress
+            now = time.monotonic()
+            if now - last_progress >= 2:
+                status(
+                    f"Scored {stats.scored:,} passages "
+                    f"({stats.cache_hits:,} cached, {stats.api_calls:,} API calls) ..."
+                )
+                last_progress = now
+
+        # The SDK handles connection pooling, Retry-After, 429 and 5xx backoff.
+        # TYPESAFE_ENDPOINT is accepted for compatibility with the cookbook.
+        endpoint = (
+            (
+                os.environ.get("TYPESAFE_BASE_URL")
+                or os.environ.get("TYPESAFE_ENDPOINT")
+                or "https://api.typesafe.ai"
+            )
+            .strip()
+            .rstrip("/")
+        )
+        if not indexed.documents:
+            results, ranked = [], RankingStats()
+        else:
+            async with AsyncTypeSafeClient(
+                model=args.model,
+                base_url=endpoint,
+                timeout=args.timeout,
+                retry=RetryPolicy(max_retries=args.retries),
+            ) as client:
+                results, ranked = await rerank(
+                    index.candidates(args.query, candidates, indexed.documents),
+                    query=args.query,
+                    top=args.top,
+                    concurrency=args.concurrency,
+                    model=args.model,
+                    endpoint=endpoint,
+                    client=client,
+                    index=index,
+                    use_cache=not args.no_score_cache,
+                    progress=progress,
+                )
+        elapsed = time.monotonic() - start
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "query": args.query,
+                        "docs": str(root),
+                        "model": args.model,
+                        "exhaustive": exhaustive,
+                        "results": [
+                            {"rank": rank, **asdict(result)}
+                            for rank, result in enumerate(results, 1)
+                        ],
+                        "stats": {
+                            **asdict(indexed),
+                            **asdict(ranked),
+                            "elapsed_seconds": elapsed,
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            for rank, result in enumerate(results, 1):
+                # Escape tabs/newlines in unusual filenames; normal paths stay readable.
+                path = json.dumps(result.path, ensure_ascii=False)[1:-1]
+                print(f"{rank}\t{result.score:.6f}\t{path}")
+        status(
+            f"Returned {len(results)} files in {elapsed:.2f}s; "
+            f"{ranked.api_calls:,} API calls, {ranked.cache_hits:,} cache hits, "
+            f"{ranked.input_tokens:,} input tokens."
+        )
+        return 0
+    finally:
+        index.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    if not args.docs.expanduser().is_dir():
+        argument_parser.error("--docs must be an existing directory")
+    if not args.query.strip():
+        argument_parser.error("--query must not be blank")
+    if len(args.query.encode()) > 8192:
+        argument_parser.error("--query must be at most 8192 UTF-8 bytes")
+    if args.candidates and args.candidates < args.top:
+        argument_parser.error("--candidates must be at least --top, or 0 for all files")
+    if not 256 <= args.chunk_chars <= 16000:
+        argument_parser.error("--chunk-chars must be between 256 and 16000")
+    if not os.environ.get("TYPESAFE_API_KEY", "").strip():
+        argument_parser.error("Set TYPESAFE_API_KEY in your environment")
+    try:
+        return asyncio.run(run(args))
+    except KeyboardInterrupt:
+        print("Interrupted. Completed scores have been cached.", file=sys.stderr)
+        return 130
+    except (OSError, sqlite3.Error, TypeSafeError, RerankError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
