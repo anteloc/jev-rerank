@@ -6,7 +6,7 @@ import httpx2
 import pytest
 from typesafe_sdk import AsyncTypeSafeClient
 
-from jev_rerank.cli import main
+from jev_rerank.cli import default_candidates, main
 from jev_rerank.rerank import DEFAULT_MODEL
 
 
@@ -53,6 +53,8 @@ def test_cli_json_end_to_end(tmp_path, monkeypatch, capsys, directory_option):
     output = capsys.readouterr()
     result = json.loads(output.out)
     assert result["results"][0]["path"] == "target.txt"
+    assert result["query"] == "target"
+    assert "criteria" not in result
     assert result["stats"]["api_calls"] == 2
     assert "Indexed 2 files" in output.err
     assert main(args) == 0
@@ -316,3 +318,100 @@ def test_show_full_value_in_both_output_formats_from_cached_scores(
     assert main(args) == 0
     assert capsys.readouterr().out.strip() == "\t".join(columns[:3])
     assert len(requests) == request_count
+
+
+# The same intent written both ways; each must reach TypeSafe identically.
+PIPE_QUERY = (
+    "a song about\nmissing love\n"
+    "| yes: the song talks about missing romantic love\n"
+    "| no: the song talks about something non-romantic"
+)
+JSON_QUERY = json.dumps(
+    {
+        "query": "a song about\nmissing love",
+        "yes": "the song talks about missing romantic love",
+        "no": "the song talks about something non-romantic",
+    }
+)
+
+
+@pytest.mark.parametrize("query", [PIPE_QUERY, JSON_QUERY])
+def test_query_criteria_reach_the_api_and_the_json_output(
+    tmp_path, monkeypatch, capsys, query
+):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "ballad.txt").write_text("I miss you every night")
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx2.Response(
+            200,
+            json={
+                "model": DEFAULT_MODEL,
+                "answers": {"relevance": {"type": "noul", "noul": 0.8}},
+                "usage": {"input_tokens": 20, "output_tokens": 1},
+            },
+        )
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "jev_rerank.cli.AsyncTypeSafeClient",
+        lambda **kwargs: AsyncTypeSafeClient(
+            transport=httpx2.MockTransport(handler), **kwargs
+        ),
+    )
+    assert (
+        main(
+            [
+                "--dir",
+                str(docs),
+                "--query",
+                query,
+                "--top",
+                "1",
+                "--cache-dir",
+                str(tmp_path / "cache"),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output["query"] == "a song about\nmissing love"
+    assert output["criteria"] == {
+        "yes": "the song talks about missing romantic love",
+        "no": "the song talks about something non-romantic",
+    }
+    # The criteria replace the Noul's defaults; the query alone is the state.
+    assert bodies[0]["state"]["query"] == "a song about\nmissing love"
+    assert bodies[0]["questions"]["relevance"]["criteria"] == {
+        "true": "the song talks about missing romantic love",
+        "false": "the song talks about something non-romantic",
+    }
+
+
+@pytest.mark.parametrize(
+    "query, message",
+    [
+        ("a song | yes: romantic only", "both a 'yes' and a 'no'"),
+        ('{"query": "a song", "nope": "x"}', "Unknown --query field"),
+        ("a song | roll", "must start with 'yes:' or 'no:'"),
+    ],
+)
+def test_invalid_query_is_rejected_with_an_actionable_message(
+    tmp_path, monkeypatch, capsys, query, message
+):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    with pytest.raises(SystemExit) as exc:
+        main(["--dir", str(tmp_path), "--query", query, "--top", "1"])
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_default_candidates_scores_medium_corpora_exhaustively():
+    """The floor must clear a few hundred documents before BM25 shortlists."""
+    assert default_candidates(1) == 500
+    assert default_candidates(10) == 500
+    assert default_candidates(80) == 800

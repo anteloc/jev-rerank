@@ -15,6 +15,7 @@ from pathlib import Path
 from typesafe_sdk import AsyncTypeSafeClient, RetryPolicy, TypeSafeError
 
 from .index import Index
+from .query import parse_query
 from .rerank import DEFAULT_MODEL, RankingStats, RerankError, rerank
 from .sqlite_source import SQLiteSource, parse_table_field
 
@@ -40,6 +41,16 @@ def timeout_value(value: str) -> float:
     return number
 
 
+def default_candidates(top: int) -> int:
+    """Score everything up to a mid-sized corpus; shortlist only beyond it.
+
+    A floor well above a few hundred documents keeps small and medium corpora
+    fully semantic, which is what a natural-language query usually needs; BM25
+    keyword shortlisting only takes over once the corpus is genuinely large.
+    """
+    return max(500, 10 * top)
+
+
 def cache_directory() -> Path:
     base = os.environ.get("XDG_CACHE_HOME")
     return (Path(base) if base else Path.home() / ".cache") / "jev-rerank"
@@ -63,7 +74,11 @@ def parser() -> argparse.ArgumentParser:
         help="Text field to search with --db; repeat to search their union",
     )
     result.add_argument(
-        "--query", required=True, help="What the best documents should match"
+        "--query",
+        required=True,
+        help="What the best documents should match: plain text, "
+        "'TEXT|yes: CRITERION|no: CRITERION', or "
+        """{"query": ..., "yes": ..., "no": ...}""",
     )
     result.add_argument(
         "--top", required=True, type=positive, help="Number of results to return"
@@ -71,7 +86,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--candidates",
         type=nonnegative,
-        help="Shortlist size (default: max(100, 10 * top)); 0 scores every passage",
+        help="Shortlist size (default: max(500, 10 * top)); 0 scores every passage",
     )
     result.add_argument(
         "--concurrency", type=positive, default=16, help="Maximum in-flight requests"
@@ -131,10 +146,11 @@ def parser() -> argparse.ArgumentParser:
 
 async def run(args: argparse.Namespace) -> int:
     start = time.monotonic()
+    query = args.parsed_query
     root = (args.db or args.docs).expanduser().resolve()
     candidates = args.candidates
     if candidates is None:
-        candidates = max(100, 10 * args.top)
+        candidates = default_candidates(args.top)
     cache_dir = args.cache_dir.expanduser().resolve()
 
     def status(message: str) -> None:
@@ -218,8 +234,8 @@ async def run(args: argparse.Namespace) -> int:
                 retry=RetryPolicy(max_retries=args.retries),
             ) as client:
                 results, ranked = await rerank(
-                    index.candidates(args.query, candidates, indexed.documents),
-                    query=args.query,
+                    index.candidates(query.text, candidates, indexed.documents),
+                    query=query,
                     top=args.top,
                     concurrency=args.concurrency,
                     model=args.model,
@@ -234,7 +250,14 @@ async def run(args: argparse.Namespace) -> int:
             print(
                 json.dumps(
                     {
-                        "query": args.query,
+                        "query": query.text,
+                        # Only present when --query supplied explicit criteria;
+                        # the parser guarantees yes and no come as a pair.
+                        **(
+                            {"criteria": {"yes": query.yes, "no": query.no}}
+                            if query.yes is not None
+                            else {}
+                        ),
                         **output_source,
                         "model": args.model,
                         "exhaustive": exhaustive,
@@ -304,10 +327,13 @@ def main(argv: list[str] | None = None) -> int:
                 parse_table_field(field)
             except ValueError as exc:
                 argument_parser.error(str(exc))
-    if not args.query.strip():
-        argument_parser.error("--query must not be blank")
+    # The cap bounds the whole spec, criteria included, before it is parsed.
     if len(args.query.encode()) > 8192:
         argument_parser.error("--query must be at most 8192 UTF-8 bytes")
+    try:
+        args.parsed_query = parse_query(args.query)
+    except ValueError as exc:
+        argument_parser.error(str(exc))
     if args.candidates and args.candidates < args.top:
         argument_parser.error(
             "--candidates must be at least --top, or 0 for all candidates"

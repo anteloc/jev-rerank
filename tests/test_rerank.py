@@ -8,7 +8,16 @@ import pytest
 from typesafe_sdk import AsyncTypeSafeClient, RetryPolicy
 
 from jev_rerank.index import Index, Passage
-from jev_rerank.rerank import DEFAULT_MODEL, RerankError, Result, TopK, rerank
+from jev_rerank.query import Query
+from jev_rerank.rerank import (
+    DEFAULT_MODEL,
+    DEFAULT_NO,
+    DEFAULT_YES,
+    RerankError,
+    Result,
+    TopK,
+    rerank,
+)
 
 
 @pytest.fixture
@@ -41,7 +50,7 @@ def client_for(handler, **kwargs):
 
 async def rank(index, client, passages, **kwargs):
     options = dict(
-        query="find the document",
+        query=Query("find the document"),
         top=3,
         concurrency=3,
         model=DEFAULT_MODEL,
@@ -73,7 +82,7 @@ async def test_real_sdk_contract_filename_state_and_cache_invalidation(index):
         assert (stats.api_calls, stats.input_tokens) == (1, 25)
         _, stats = await rank(index, client, passages)
         assert (stats.cache_hits, stats.api_calls) == (1, 0)
-        await rank(index, client, passages, query="different query")
+        await rank(index, client, passages, query=Query("different query"))
         await rank(index, client, passages, model="another-model")
         await rank(index, client, passages, endpoint="https://another-endpoint.test")
         await rank(index, client, [passage("folder/needle.txt", "new text")])
@@ -177,3 +186,57 @@ async def test_oversized_state_fails_before_request(index):
     async with client_for(handler) as client:
         with pytest.raises(RerankError, match="smaller --chunk-chars"):
             await rank(index, client, [passage("file.txt", "文" * 15000)])
+
+
+async def test_query_criteria_replace_the_defaults_and_key_the_cache(index):
+    questions = []
+
+    def handler(request):
+        questions.append(json.loads(request.content)["questions"]["relevance"])
+        return httpx2.Response(200, json=payload(0.7))
+
+    passages = [passage("file.txt")]
+    romantic = Query("missing love", "romantic loss", "love for books")
+    async with client_for(handler) as client:
+        await rank(index, client, passages)
+        await rank(index, client, passages, query=romantic)
+        # Identical criteria reuse the cached judgment; any change re-asks.
+        _, stats = await rank(index, client, passages, query=romantic)
+        assert stats.cache_hits == 1
+        equal = Query("missing love", "romantic loss", "love for books")
+        _, stats = await rank(index, client, passages, query=equal)
+        assert stats.cache_hits == 1
+        different = Query("missing love", "romantic loss", "love for hats")
+        await rank(index, client, passages, query=different)
+    assert len(questions) == 3
+    assert questions[0]["criteria"] == {"true": DEFAULT_YES, "false": DEFAULT_NO}
+    assert questions[1]["criteria"] == {
+        "true": "romantic loss",
+        "false": "love for books",
+    }
+    assert questions[2]["criteria"] == {
+        "true": "romantic loss",
+        "false": "love for hats",
+    }
+    # Only the criteria change; the instructions stay the general ranking question.
+    assert len({question["instructions"] for question in questions}) == 1
+
+
+async def test_one_question_serves_both_files_and_database_records(index):
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx2.Response(200, json=payload(0.5))
+
+    source = {"type": "sqlite", "table": "songs", "field": "lyrics", "key": {"id": 1}}
+    record = Passage("sqlite://songs/lyrics?key=1", "words", 0, "digest", source)
+    async with client_for(handler) as client:
+        await rank(index, client, [passage("folder/a.txt"), record])
+    file_body, record_body = sorted(
+        bodies, key=lambda body: "table" in body["state"]["candidate"]
+    )
+    assert file_body["questions"] == record_body["questions"]
+    assert file_body["state"]["candidate"]["filename"] == "a.txt"
+    assert "filename" not in record_body["state"]["candidate"]
+    assert record_body["state"]["candidate"]["table"] == "songs"

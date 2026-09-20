@@ -51,6 +51,41 @@ the indexed snapshot used for the search; showing it makes no additional API cal
 Full values are loaded only for returned results when `--show` is enabled, so very
 large matches can increase memory usage and output size.
 
+## Query criteria
+
+`--query` accepts plain text, or the same text plus an explicit **yes/no** pair
+that replaces the ranking question's default criteria. Use it to say where the
+line falls when a plain query is too broad:
+
+```sh
+uv run jev-rerank --dir ./lyrics --top 5 --query 'a song about missing love
+| yes: the song talks about missing romantic love
+| no: the song talks about something non-romantic, whatever it is like e.g. love for books or music'
+```
+
+`|` separates the sections and spaces around it are optional. The first section
+is the query; every later section carries a mandatory `yes:` or `no:` prefix.
+Sections may span several lines.
+
+The same search as inline JSON, which is easier to generate from a script:
+
+```sh
+uv run jev-rerank --dir ./lyrics --top 5 --query '{
+  "query": "a song about missing love",
+  "yes": "the song talks about missing romantic love",
+  "no": "the song talks about something non-romantic, like love for books or music"
+}'
+```
+
+The JSON form is strict JSON, so a multi-line value uses `\n` escapes, and only
+`query`, `yes` and `no` are accepted. In both forms `yes` and `no` are
+both-or-neither: supplying one without the other is an error, because a Noul
+needs both sides of the judgment. A plain query containing a literal `|` must
+use the JSON form.
+
+Criteria are part of the score cache key, so editing them re-asks the model.
+With `--json` they are echoed back in a `criteria` object next to `query`.
+
 ## SQLite records
 
 Use `--db` instead of `--dir` and repeat `--table-field TABLE_NAME.FIELD_NAME` to
@@ -121,7 +156,7 @@ value; `--candidates 0` scores every passage of every selected text value.
    complete text in a persistent SQLite FTS5 index on disk. Later runs check file
    size, modification time, and change time, and reread only changed files. Deleted
    files are removed from the index. There is no silent truncation of long files.
-3. For large collections, BM25 selects up to `max(100, 10 * top)` distinct files,
+3. For large collections, BM25 selects up to `max(500, 10 * top)` distinct files,
    weighting their relative paths five times as strongly as passage text. Score
    the best matching passage from each shortlisted file. If lexical matches do
    not fill the shortlist, fill remaining slots by alphabetical path.
@@ -147,16 +182,21 @@ Each file-scoring API request has this state:
 }
 ```
 
-The question generalizes the recipe's Noul to “does this document match the search
-intent?” Its criteria explicitly allow filename/title/author searches and semantic
-content matches. The score is TypeSafe's probability of that yes/no judgment,
-between 0 and 1, sorted descending. Equal scores are ordered by path. These are
-model judgments, not guaranteed relevance measurements.
+One Noul question serves both sources: it generalizes the recipe's Noul to
+“does this candidate text match the search intent?” `candidate.passage` is always
+the text being judged; the remaining fields only say where it came from, either a
+filename and path or a table, field and key. Its default criteria allow
+filename/title/author searches as well as semantic content matches, and
+[query criteria](#query-criteria) replace them. The score is TypeSafe's
+probability of that yes/no judgment, between 0 and 1, sorted descending. Equal
+scores are ordered by path. These are model judgments, not guaranteed relevance
+measurements.
 
 ## Speed and coverage
 
-The default shortlist makes API work independent of corpus size once the index
-is built. The initial run still reads the corpus; subsequent runs still scan file
+Up to 500 documents the default scores everything, so a natural-language query
+is never narrowed by keyword retrieval first. Beyond that the shortlist makes API
+work independent of corpus size once the index is built. The initial run still reads the corpus; subsequent runs still scan file
 metadata. The index consumes disk space proportional to the text, including
 overlap and search structures. Application memory does not hold the entire corpus
 or create one task per file; it holds active passages, the shortlist, and top-k
@@ -187,8 +227,8 @@ spread across separate passages. Larger passages can help when context matters.
 | `--dir` / `--docs` | one source required | Corpus directory; mutually exclusive with `--db` |
 | `--db` | one source required | SQLite database; requires `--table-field` |
 | `--table-field` | required with `--db` | Repeatable `TABLE.FIELD` selector; fields share one ranking |
-| `--query`, `--top` | required | Search intent and result count |
-| `--candidates` | `max(100, 10 * top)` | Distinct files or field values to shortlist; `0` scores everything |
+| `--query`, `--top` | required | Search intent (see [Query criteria](#query-criteria)) and result count |
+| `--candidates` | `max(500, 10 * top)` | Distinct files or field values to shortlist; `0` scores everything |
 | `--concurrency` | `16` | Maximum simultaneous API calls |
 | `--model` | `jev-1.13.0` | Model ID; also accepts `TYPESAFE_DEFAULT_MODEL` |
 | `--cache-dir` | `$XDG_CACHE_HOME/jev-rerank` or `~/.cache/jev-rerank` | Local text index and score cache |
@@ -209,7 +249,7 @@ if the corpus contains fewer valid files or field values. An empty corpus return
 for compatibility with the cookbook. Do not put credentials in the URL.
 
 The model version is pinned so cached results remain meaningful. Score cache keys
-include the query, question definition, endpoint, model, relative filename/path,
+include the query, the question definition with any yes/no criteria, endpoint, model, relative filename/path,
 passage index, and content hash. Model aliases may change remotely; use
 `--no-score-cache` when fresh alias results are needed. Indexes are isolated by
 corpus directory and passage size. The cache holds document text locally and grows
