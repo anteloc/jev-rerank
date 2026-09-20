@@ -1,4 +1,6 @@
 import json
+import sqlite3
+from contextlib import closing
 
 import httpx2
 import pytest
@@ -8,7 +10,8 @@ from jev_rerank.cli import main
 from jev_rerank.rerank import DEFAULT_MODEL
 
 
-def test_cli_json_end_to_end(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("directory_option", ["--dir", "--docs"])
+def test_cli_json_end_to_end(tmp_path, monkeypatch, capsys, directory_option):
     docs = tmp_path / "docs"
     docs.mkdir()
     (docs / "target.txt").write_text("relevant content")
@@ -36,7 +39,7 @@ def test_cli_json_end_to_end(tmp_path, monkeypatch, capsys):
         ),
     )
     args = [
-        "--docs",
+        directory_option,
         str(docs),
         "--query",
         "target",
@@ -109,3 +112,207 @@ def test_empty_directory(tmp_path, monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["results"] == []
     assert output["stats"]["api_calls"] == 0
+
+
+def test_database_cli_ranks_union_and_reuses_cache(tmp_path, monkeypatch, capsys):
+    database = tmp_path / "records.db"
+    with closing(sqlite3.connect(database)) as db, db:
+        db.executescript("""
+            CREATE TABLE songs(id INTEGER PRIMARY KEY, title VARCHAR, lyrics CLOB);
+            CREATE TABLE notes(id TEXT PRIMARY KEY, body TEXT);
+            INSERT INTO songs VALUES (1, 'Ocean', 'Sail across the sea');
+            INSERT INTO notes VALUES ('note-a', 'Oceans contain saltwater');
+        """)
+    original = database.read_bytes()
+    requests = []
+    scores = {("songs", "title"): 0.5, ("songs", "lyrics"): 0.9, ("notes", "body"): 0.7}
+
+    def handler(request):
+        body = json.loads(request.content)
+        candidate = body["state"]["candidate"]
+        requests.append(candidate)
+        assert "filename" not in candidate
+        assert candidate["type"] == "sqlite"
+        assert candidate["database"] == str(database)
+        assert candidate["key"] in ({"id": 1}, {"id": "note-a"})
+        score = scores[candidate["table"], candidate["field"]]
+        return httpx2.Response(
+            200,
+            json={
+                "model": DEFAULT_MODEL,
+                "answers": {"relevance": {"type": "noul", "noul": score}},
+                "usage": {"input_tokens": 20, "output_tokens": 1},
+            },
+        )
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "jev_rerank.cli.AsyncTypeSafeClient",
+        lambda **kwargs: AsyncTypeSafeClient(
+            transport=httpx2.MockTransport(handler), **kwargs
+        ),
+    )
+    base = [
+        "--db",
+        str(database),
+        "--query",
+        "ocean",
+        "--top",
+        "3",
+        "--cache-dir",
+        str(tmp_path / "cache"),
+        "--json",
+    ]
+    selections = [
+        "--table-field",
+        "songs.title",
+        "--table-field",
+        "songs.lyrics",
+        "--table-field",
+        "notes.body",
+    ]
+    assert main(base + selections) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["db"] == str(database)
+    assert "docs" not in output
+    assert [r["source"]["field"] for r in output["results"]] == [
+        "lyrics",
+        "body",
+        "title",
+    ]
+    assert output["stats"]["api_calls"] == 3
+    assert main(base + selections + ["--table-field", "SONGS.TITLE"]) == 0
+    cached = json.loads(capsys.readouterr().out)
+    assert cached["stats"]["cache_hits"] == 3
+    assert cached["stats"]["updated"] == 0
+    assert len(requests) == 3
+    assert database.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        (["--db", "{db}"], "requires at least one --table-field"),
+        (["--dir", "{dir}", "--db", "{db}"], "not allowed with argument"),
+        (["--dir", "{dir}", "--table-field", "t.body"], "--table-field requires --db"),
+        (
+            ["--db", "{db}", "--table-field", "malformed"],
+            "expected TABLE_NAME.FIELD_NAME",
+        ),
+    ],
+)
+def test_invalid_source_options(tmp_path, monkeypatch, capsys, options, message):
+    database = tmp_path / "data.db"
+    with closing(sqlite3.connect(database)) as db:
+        db.execute("CREATE TABLE t (body TEXT)")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    args = [option.format(db=database, dir=tmp_path) for option in options]
+    with pytest.raises(SystemExit) as exc:
+        main(args + ["--query", "test", "--top", "1"])
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_invalid_database_field_exits_without_partial_results(
+    tmp_path, monkeypatch, capsys
+):
+    database = tmp_path / "data.db"
+    with closing(sqlite3.connect(database)) as db:
+        db.execute("CREATE TABLE t (body INTEGER)")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    assert (
+        main(
+            [
+                "--db",
+                str(database),
+                "--table-field",
+                "t.body",
+                "--query",
+                "x",
+                "--top",
+                "1",
+                "--cache-dir",
+                str(tmp_path / "cache"),
+            ]
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "declared text type" in output.err
+
+
+@pytest.mark.parametrize("source_kind", ["file", "sqlite"])
+@pytest.mark.parametrize(
+    "value", ["", "Intro café\n" + 'Line\t"quoted" 🦊\n' * 40 + "MATCH"]
+)
+def test_show_full_value_in_both_output_formats_from_cached_scores(
+    tmp_path, monkeypatch, capsys, source_kind, value
+):
+    if source_kind == "file":
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "target.txt").write_text(value, encoding="utf-8")
+        source_args = ["--dir", str(docs)]
+    else:
+        database = tmp_path / "data.db"
+        with closing(sqlite3.connect(database)) as db, db:
+            db.execute("CREATE TABLE records (id INTEGER PRIMARY KEY, body CLOB)")
+            db.execute("INSERT INTO records VALUES (1, ?)", (value,))
+        source_args = ["--db", str(database), "--table-field", "records.body"]
+
+    requests = []
+
+    def handler(request):
+        candidate = json.loads(request.content)["state"]["candidate"]
+        requests.append(candidate)
+        score = 0.9 if "MATCH" in candidate["passage"] else 0.1
+        return httpx2.Response(
+            200,
+            json={
+                "model": DEFAULT_MODEL,
+                "answers": {"relevance": {"type": "noul", "noul": score}},
+                "usage": {"input_tokens": 20, "output_tokens": 1},
+            },
+        )
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "jev_rerank.cli.AsyncTypeSafeClient",
+        lambda **kwargs: AsyncTypeSafeClient(
+            transport=httpx2.MockTransport(handler), **kwargs
+        ),
+    )
+    args = source_args + [
+        "--query",
+        "MATCH",
+        "--top",
+        "1",
+        "--chunk-chars",
+        "256",
+        "--cache-dir",
+        str(tmp_path / "cache"),
+    ]
+    assert main(args + ["--json"]) == 0
+    original = json.loads(capsys.readouterr().out)
+    assert "text" not in original["results"][0]
+    if value:
+        assert original["results"][0]["passage"] > 0
+    request_count = len(requests)
+
+    assert main(args + ["--show", "--json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["results"][0] == {**original["results"][0], "text": value}
+    assert shown["stats"]["api_calls"] == 0
+    assert shown["stats"]["cache_hits"] == request_count
+
+    assert main(args + ["--show"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    columns = lines[0].split("\t")
+    assert len(columns) == 4
+    assert json.loads(columns[3]) == value
+
+    assert main(args) == 0
+    assert capsys.readouterr().out.strip() == "\t".join(columns[:3])
+    assert len(requests) == request_count

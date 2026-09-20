@@ -16,6 +16,7 @@ from typesafe_sdk import AsyncTypeSafeClient, RetryPolicy, TypeSafeError
 
 from .index import Index
 from .rerank import DEFAULT_MODEL, RankingStats, RerankError, rerank
+from .sqlite_source import SQLiteSource, parse_table_field
 
 
 def positive(value: str) -> int:
@@ -46,15 +47,26 @@ def cache_directory() -> Path:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Find text files using BM25 retrieval and TypeSafe reranking.",
+        description="Search text files or SQLite fields with BM25 and TypeSafe.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    result.add_argument("--docs", required=True, type=Path, help="Text files directory")
+    sources = result.add_mutually_exclusive_group(required=True)
+    sources.add_argument(
+        "--dir", "--docs", dest="docs", type=Path, help="Text files directory"
+    )
+    sources.add_argument("--db", type=Path, help="SQLite database to read")
+    result.add_argument(
+        "--table-field",
+        action="append",
+        default=[],
+        metavar="TABLE.FIELD",
+        help="Text field to search with --db; repeat to search their union",
+    )
     result.add_argument(
         "--query", required=True, help="What the best documents should match"
     )
     result.add_argument(
-        "--top", required=True, type=positive, help="Number of files to return"
+        "--top", required=True, type=positive, help="Number of results to return"
     )
     result.add_argument(
         "--candidates",
@@ -96,7 +108,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--rebuild",
         action="store_true",
-        help="Reread all files, even if metadata is unchanged",
+        help="Reindex all source text, even if unchanged",
     )
     result.add_argument(
         "--no-score-cache",
@@ -107,6 +119,11 @@ def parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Write structured JSON to stdout"
     )
     result.add_argument(
+        "--show",
+        action="store_true",
+        help="Include the full text of each returned file or database field value",
+    )
+    result.add_argument(
         "--quiet", action="store_true", help="Hide progress; still report warnings"
     )
     return result
@@ -114,15 +131,11 @@ def parser() -> argparse.ArgumentParser:
 
 async def run(args: argparse.Namespace) -> int:
     start = time.monotonic()
-    root = args.docs.expanduser().resolve()
+    root = (args.db or args.docs).expanduser().resolve()
     candidates = args.candidates
     if candidates is None:
         candidates = max(100, 10 * args.top)
     cache_dir = args.cache_dir.expanduser().resolve()
-    # A separate index per root and chunking configuration avoids accidental
-    # corpus mixing and lets different passage sizes coexist.
-    identity = hashlib.sha256(f"{root}\0{args.chunk_chars}".encode()).hexdigest()[:24]
-    database = cache_dir / f"{identity}.sqlite3"
 
     def status(message: str) -> None:
         if not args.quiet:
@@ -131,12 +144,36 @@ async def run(args: argparse.Namespace) -> int:
     def warning(message: str) -> None:
         print(f"Warning: {message}", file=sys.stderr, flush=True)
 
-    index = Index(database, root, args.chunk_chars)
+    index = None
+    units = "field values" if args.db else "files"
     try:
         status(f"Refreshing index for {root} ...")
-        indexed = index.sync(warning, rebuild=args.rebuild)
+        if args.db:
+            with SQLiteSource(root, args.table_field) as source:
+                source_id = json.dumps(["sqlite", source.table_fields])
+                identity = hashlib.sha256(
+                    f"{root}\0{args.chunk_chars}\0{source_id}".encode()
+                ).hexdigest()[:24]
+                index = Index(
+                    cache_dir / f"{identity}.sqlite3",
+                    root,
+                    args.chunk_chars,
+                    source_id=source_id,
+                )
+                indexed = index.sync_records(
+                    source.records(), warning, rebuild=args.rebuild
+                )
+                output_source = {"db": str(root), "table_fields": source.table_fields}
+        else:
+            # Retain the existing cache identity for file searches.
+            identity = hashlib.sha256(
+                f"{root}\0{args.chunk_chars}".encode()
+            ).hexdigest()[:24]
+            index = Index(cache_dir / f"{identity}.sqlite3", root, args.chunk_chars)
+            indexed = index.sync(warning, rebuild=args.rebuild)
+            output_source = {"docs": str(root)}
         status(
-            f"Indexed {indexed.documents:,} files / {indexed.passages:,} passages "
+            f"Indexed {indexed.documents:,} {units} / {indexed.passages:,} passages "
             f"({indexed.updated:,} updated, {indexed.skipped:,} skipped, "
             f"{indexed.removed:,} removed)."
         )
@@ -145,8 +182,8 @@ async def run(args: argparse.Namespace) -> int:
             status(f"Scoring all {indexed.passages:,} passages with TypeSafe ...")
         else:
             status(
-                f"Reranking up to {candidates:,} files from a BM25 shortlist "
-                "(one matching passage per file); --candidates 0 scores everything."
+                f"Reranking up to {candidates:,} {units} from a BM25 shortlist "
+                "(one passage per candidate); --candidates 0 scores everything."
             )
         last_progress = time.monotonic()
 
@@ -198,11 +235,23 @@ async def run(args: argparse.Namespace) -> int:
                 json.dumps(
                     {
                         "query": args.query,
-                        "docs": str(root),
+                        **output_source,
                         "model": args.model,
                         "exhaustive": exhaustive,
                         "results": [
-                            {"rank": rank, **asdict(result)}
+                            {
+                                "rank": rank,
+                                **{
+                                    key: value
+                                    for key, value in asdict(result).items()
+                                    if value is not None
+                                },
+                                **(
+                                    {"text": index.document_text(result.path)}
+                                    if args.show
+                                    else {}
+                                ),
+                            }
                             for rank, result in enumerate(results, 1)
                         ],
                         "stats": {
@@ -219,28 +268,50 @@ async def run(args: argparse.Namespace) -> int:
             for rank, result in enumerate(results, 1):
                 # Escape tabs/newlines in unusual filenames; normal paths stay readable.
                 path = json.dumps(result.path, ensure_ascii=False)[1:-1]
-                print(f"{rank}\t{result.score:.6f}\t{path}")
+                line = f"{rank}\t{result.score:.6f}\t{path}"
+                if args.show:
+                    text = json.dumps(
+                        index.document_text(result.path), ensure_ascii=False
+                    )
+                    line += f"\t{text}"
+                print(line)
         status(
-            f"Returned {len(results)} files in {elapsed:.2f}s; "
+            f"Returned {len(results)} {units} in {elapsed:.2f}s; "
             f"{ranked.api_calls:,} API calls, {ranked.cache_hits:,} cache hits, "
             f"{ranked.input_tokens:,} input tokens."
         )
         return 0
     finally:
-        index.close()
+        if index is not None:
+            index.close()
 
 
 def main(argv: list[str] | None = None) -> int:
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
-    if not args.docs.expanduser().is_dir():
-        argument_parser.error("--docs must be an existing directory")
+    if args.docs is not None:
+        if not args.docs.expanduser().is_dir():
+            argument_parser.error("--dir must be an existing directory")
+        if args.table_field:
+            argument_parser.error("--table-field requires --db")
+    else:
+        if not args.db.expanduser().is_file():
+            argument_parser.error("--db must be an existing SQLite database file")
+        if not args.table_field:
+            argument_parser.error("--db requires at least one --table-field")
+        for field in args.table_field:
+            try:
+                parse_table_field(field)
+            except ValueError as exc:
+                argument_parser.error(str(exc))
     if not args.query.strip():
         argument_parser.error("--query must not be blank")
     if len(args.query.encode()) > 8192:
         argument_parser.error("--query must be at most 8192 UTF-8 bytes")
     if args.candidates and args.candidates < args.top:
-        argument_parser.error("--candidates must be at least --top, or 0 for all files")
+        argument_parser.error(
+            "--candidates must be at least --top, or 0 for all candidates"
+        )
     if not 256 <= args.chunk_chars <= 16000:
         argument_parser.error("--chunk-chars must be between 256 and 16000")
     if not os.environ.get("TYPESAFE_API_KEY", "").strip():

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
+
+from .sqlite_source import Record
 
 SCHEMA_VERSION = "1"
 
@@ -20,6 +24,7 @@ class Passage:
     text: str
     ordinal: int
     digest: str
+    source: dict[str, Any] | None = None
 
 
 @dataclass
@@ -71,9 +76,20 @@ def match_expression(query: str) -> str:
 
 
 class Index:
-    def __init__(self, database: Path, root: Path, chunk_chars: int = 4000):
+    def __init__(
+        self,
+        database: Path,
+        root: Path,
+        chunk_chars: int = 4000,
+        *,
+        source_id: str | None = None,
+    ):
         self.root = root.resolve()
         self.database = database.resolve()
+        if self.database == self.root:
+            raise ValueError(
+                "The source database and cache database must be different files"
+            )
         self.chunk_chars = chunk_chars
         self.overlap = min(400, chunk_chars // 10)
         database.parent.mkdir(parents=True, exist_ok=True)
@@ -95,6 +111,11 @@ class Index:
                 document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
                 path TEXT NOT NULL, text TEXT NOT NULL,
                 ordinal INTEGER NOT NULL, digest TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS record_sources (
+                document_id INTEGER PRIMARY KEY
+                    REFERENCES documents(id) ON DELETE CASCADE,
+                metadata TEXT NOT NULL, digest TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS passages_document
                 ON passages(document_id, ordinal);
@@ -119,6 +140,8 @@ class Index:
             "root": str(self.root),
             "chunk_chars": str(chunk_chars),
         }
+        if source_id is not None:
+            expected["source"] = source_id
         actual = dict(self.db.execute("SELECT key, value FROM metadata"))
         if actual and actual != expected:
             self.db.close()
@@ -209,12 +232,102 @@ class Index:
 
     @staticmethod
     def _passage(row: sqlite3.Row) -> Passage:
-        return Passage(row["path"], row["text"], row["ordinal"], row["digest"])
+        return Passage(
+            row["path"],
+            row["text"],
+            row["ordinal"],
+            row["digest"],
+            json.loads(row["metadata"]) if row["metadata"] else None,
+        )
+
+    def sync_records(
+        self,
+        records: Iterable[Record],
+        warn: Callable[[str], None],
+        *,
+        rebuild: bool = False,
+    ) -> IndexStats:
+        """Stream cells, hashing content so only changed values are reindexed."""
+        stats = IndexStats()
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute("CREATE TEMP TABLE seen (id INTEGER PRIMARY KEY)")
+            for record in records:
+                if record.value is None:
+                    stats.skipped += 1
+                    continue
+                if not isinstance(record.value, str) or "\x00" in record.value:
+                    stats.skipped += 1
+                    warn(f"Skipping {record.path}: stored value is not valid text")
+                    continue
+                encoded = record.value.encode()
+                digest = hashlib.sha256(encoded).hexdigest()
+                metadata = json.dumps(record.source, sort_keys=True)
+                old = self.db.execute(
+                    "SELECT d.id, r.digest, r.metadata FROM documents d "
+                    "JOIN record_sources r ON r.document_id=d.id WHERE d.path=?",
+                    (record.path,),
+                ).fetchone()
+                if (
+                    not rebuild
+                    and old
+                    and (old["digest"], old["metadata"]) == (digest, metadata)
+                ):
+                    doc_id = old["id"]
+                else:
+                    if old:
+                        self.db.execute(
+                            "DELETE FROM documents WHERE id=?", (old["id"],)
+                        )
+                    doc_id = self.db.execute(
+                        "INSERT INTO documents(path, mtime_ns, ctime_ns, size) "
+                        "VALUES (?, 0, 0, ?)",
+                        (record.path, len(encoded)),
+                    ).lastrowid
+                    self.db.execute(
+                        "INSERT INTO record_sources VALUES (?, ?, ?)",
+                        (doc_id, metadata, digest),
+                    )
+                    for ordinal, text in enumerate(
+                        read_passages(
+                            StringIO(record.value), self.chunk_chars, self.overlap
+                        )
+                    ):
+                        self.db.execute(
+                            "INSERT INTO passages(document_id, path, text, "
+                            "ordinal, digest) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (
+                                doc_id,
+                                record.path,
+                                text,
+                                ordinal,
+                                hashlib.sha256(text.encode()).hexdigest(),
+                            ),
+                        )
+                    stats.updated += 1
+                self.db.execute("INSERT INTO seen VALUES (?)", (doc_id,))
+            stats.removed = self.db.execute(
+                "DELETE FROM documents WHERE id NOT IN (SELECT id FROM seen)"
+            ).rowcount
+            self.db.execute("DROP TABLE seen")
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        stats.documents = self.db.execute("SELECT count(*) FROM documents").fetchone()[
+            0
+        ]
+        stats.passages = self.db.execute("SELECT count(*) FROM passages").fetchone()[0]
+        return stats
 
     def candidates(self, query: str, limit: int, documents: int) -> Iterator[Passage]:
         """All passages in exhaustive mode; one best passage per shortlisted file."""
         if limit == 0 or documents <= limit:
-            cursor = self.db.execute("SELECT * FROM passages ORDER BY id")
+            cursor = self.db.execute(
+                "SELECT p.*, r.metadata FROM passages p LEFT JOIN record_sources r "
+                "ON r.document_id=p.document_id ORDER BY p.id"
+            )
             for row in cursor:
                 yield self._passage(row)
             return
@@ -225,7 +338,9 @@ class Index:
             # Streaming avoids an in-memory sort of the corpus. FTS5's rank
             # column uses its optimized BM25 ordering; filename weight is 5x.
             cursor = self.db.execute(
-                "SELECT p.* FROM search JOIN passages p ON p.id=search.rowid "
+                "SELECT p.*, r.metadata FROM search "
+                "JOIN passages p ON p.id=search.rowid "
+                "LEFT JOIN record_sources r ON r.document_id=p.document_id "
                 "WHERE search MATCH ? AND rank MATCH 'bm25(5.0, 1.0)' "
                 "ORDER BY rank",
                 (expression,),
@@ -240,8 +355,9 @@ class Index:
         # Fill sparse/no-keyword shortlists deterministically. This is not a
         # semantic guarantee; callers can request exhaustive scoring with 0.
         cursor = self.db.execute(
-            "SELECT p.* FROM documents d JOIN passages p ON p.document_id=d.id "
-            "AND p.ordinal=0 ORDER BY d.path"
+            "SELECT p.*, r.metadata FROM documents d JOIN passages p "
+            "ON p.document_id=d.id AND p.ordinal=0 "
+            "LEFT JOIN record_sources r ON r.document_id=d.id ORDER BY d.path"
         )
         for row in cursor:
             if row["document_id"] not in selected:
@@ -249,6 +365,19 @@ class Index:
                 yield self._passage(row)
                 if len(selected) >= limit:
                     return
+
+    def document_text(self, path: str) -> str:
+        """Recover a result's complete indexed value without repeating overlap."""
+        cursor = self.db.execute(
+            "SELECT p.text, p.ordinal FROM passages p "
+            "JOIN documents d ON d.id=p.document_id "
+            "WHERE d.path=? ORDER BY p.ordinal",
+            (path,),
+        )
+        first = cursor.fetchone()
+        if first is None:
+            raise ValueError(f"No indexed text for result {path!r}")
+        return first["text"] + "".join(row["text"][self.overlap :] for row in cursor)
 
     def cached_score(self, key: str) -> float | None:
         row = self.db.execute("SELECT score FROM scores WHERE key=?", (key,)).fetchone()
