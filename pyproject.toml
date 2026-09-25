@@ -1,6 +1,6 @@
 [project]
 name = "jev-rerank"
-version = "0.1.0"
+version = "0.5.0"
 description = "Fast, disk-backed document retrieval and TypeSafe semantic reranking"
 readme = "README.md"
 requires-python = ">=3.11"
