@@ -200,6 +200,34 @@ def test_blob_primary_key_is_json_serializable(tmp_path):
     json.dumps(record.source)
 
 
+def test_view_without_natural_key_uses_row_number_as_synthetic_key(tmp_path):
+    path = tmp_path / "source.sqlite"
+    with closing(sqlite3.connect(path)) as db, db:
+        db.executescript("""
+            CREATE TABLE parts (part TEXT PRIMARY KEY, description TEXT);
+            INSERT INTO parts VALUES ('3001', 'Brick 2x4');
+            INSERT INTO parts VALUES ('3002', 'Brick 2x3');
+            CREATE VIEW parts_jev (full_description) AS
+                SELECT part || '|' || description AS full_description FROM parts;
+        """)
+    with SQLiteSource(path, ["parts_jev.full_description"]) as source:
+        records = list(source.records())
+    assert {r.value for r in records} == {"3001|Brick 2x4", "3002|Brick 2x3"}
+    assert {r.source["key"]["_row_number_"] for r in records} == {1, 2}
+    assert len({r.path for r in records}) == 2
+    json.dumps([r.source for r in records])
+
+
+def test_table_with_no_accessible_identity_is_rejected(tmp_path):
+    path = tmp_path / "source.sqlite"
+    with closing(sqlite3.connect(path)) as db, db:
+        db.executescript("""
+            CREATE TABLE data (rowid TEXT, "_rowid_" TEXT, oid TEXT, body TEXT);
+        """)
+    with pytest.raises(ValueError, match="needs a primary key or accessible rowid"):
+        SQLiteSource(path, ["data.body"])
+
+
 def test_scan_failure_rolls_back_index(database, index):
     sync(index, database, ["songs.title"])
     previous = list(index.candidates("", 0, 2))

@@ -21,7 +21,8 @@ def test_cli_json_end_to_end(tmp_path, monkeypatch, capsys, directory_option):
     def handler(request):
         body = json.loads(request.content)
         requests.append(body)
-        score = 0.95 if body["state"]["candidate"]["filename"] == "target.txt" else 0.1
+        assert set(body["state"]) == {"query", "text"}
+        score = 0.95 if body["state"]["text"].startswith("target.txt") else 0.1
         return httpx2.Response(
             200,
             json={
@@ -127,17 +128,16 @@ def test_database_cli_ranks_union_and_reuses_cache(tmp_path, monkeypatch, capsys
         """)
     original = database.read_bytes()
     requests = []
-    scores = {("songs", "title"): 0.5, ("songs", "lyrics"): 0.9, ("notes", "body"): 0.7}
+    scores = {"Ocean": 0.5, "Sail": 0.9, "Oceans": 0.7}
 
     def handler(request):
         body = json.loads(request.content)
-        candidate = body["state"]["candidate"]
-        requests.append(candidate)
-        assert "filename" not in candidate
-        assert candidate["type"] == "sqlite"
-        assert candidate["database"] == str(database)
-        assert candidate["key"] in ({"id": 1}, {"id": "note-a"})
-        score = scores[candidate["table"], candidate["field"]]
+        state = body["state"]
+        requests.append(state)
+        # A record sends its field value alone: no locator, table, field or key.
+        assert set(state) == {"query", "text"}
+        assert str(database) not in json.dumps(state)
+        score = scores[state["text"].split()[0]]
         return httpx2.Response(
             200,
             json={
@@ -266,9 +266,9 @@ def test_show_full_value_in_both_output_formats_from_cached_scores(
     requests = []
 
     def handler(request):
-        candidate = json.loads(request.content)["state"]["candidate"]
-        requests.append(candidate)
-        score = 0.9 if "MATCH" in candidate["passage"] else 0.1
+        state = json.loads(request.content)["state"]
+        requests.append(state)
+        score = 0.9 if "MATCH" in state["text"] else 0.1
         return httpx2.Response(
             200,
             json={

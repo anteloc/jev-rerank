@@ -50,6 +50,7 @@ class Selection:
     fields: list[str]
     primary_key: list[str]
     rowid: str | None
+    synthetic_rowid: bool = False
 
 
 class SQLiteSource:
@@ -84,15 +85,16 @@ class SQLiteSource:
         for value in table_fields:
             table, field = parse_table_field(value)
             found = self.db.execute(
-                "SELECT name FROM sqlite_schema WHERE type='table' "
+                "SELECT name, type FROM sqlite_schema WHERE type IN ('table', 'view') "
                 "AND name = ? COLLATE NOCASE",
                 (table,),
             ).fetchone()
             if not found or found["name"].lower().startswith("sqlite_"):
                 raise ValueError(
-                    f"Table {table!r} does not exist or is not a user table"
+                    f"Table {table!r} does not exist or is not a user table or view"
                 )
             table = found["name"]
+            is_view = found["type"] == "view"
             columns = self.db.execute(
                 "SELECT name, type, pk FROM pragma_table_xinfo(?)", (table,)
             ).fetchall()
@@ -105,7 +107,10 @@ class SQLiteSource:
             if column is None:
                 raise ValueError(f"Field {field!r} does not exist in table {table!r}")
             field = column["name"]
-            if not is_text_type(column["type"]):
+            # Computed view columns (e.g. `a || b`) have no declared type even
+            # though they always yield text; only reject a *known* non-text type.
+            view_column_type_is_unknown = is_view and not column["type"]
+            if not view_column_type_is_unknown and not is_text_type(column["type"]):
                 raise ValueError(
                     f"{table}.{field} must have a declared text type "
                     "(TEXT, CLOB, VARCHAR, etc.); "
@@ -127,12 +132,19 @@ class SQLiteSource:
                             f"FROM {identifier(table)} AS t LIMIT 0"
                         )
                     except sqlite3.OperationalError:
-                        rowid = None  # WITHOUT ROWID tables use the primary key.
+                        rowid = None  # Views and WITHOUT ROWID tables have no rowid.
+                synthetic_rowid = False
                 if not keys and not rowid:
-                    raise ValueError(
-                        f"Table {table!r} needs a primary key or accessible rowid"
-                    )
-                selected[table] = Selection(table, [], keys, rowid)
+                    if not is_view:
+                        raise ValueError(
+                            f"Table {table!r} needs a primary key or accessible rowid"
+                        )
+                    # Views have no primary key or rowid of their own; number
+                    # their rows within this snapshot so each gets a key.
+                    candidates = ("_row_number_", "__row_number__", "___row_number___")
+                    rowid = next(name for name in candidates if name not in names)
+                    synthetic_rowid = True
+                selected[table] = Selection(table, [], keys, rowid, synthetic_rowid)
             if field not in selected[table].fields:
                 selected[table].fields.append(field)
         for selection in selected.values():
@@ -146,7 +158,12 @@ class SQLiteSource:
             if selection.rowid:
                 names.append(selection.rowid)
             names.extend(selection.fields)
-            projection = ", ".join(f"t.{identifier(name)}" for name in names)
+            projection = ", ".join(
+                f"ROW_NUMBER() OVER () AS {identifier(name)}"
+                if selection.synthetic_rowid and name == selection.rowid
+                else f"t.{identifier(name)}"
+                for name in names
+            )
             cursor = self.db.execute(
                 f"SELECT {projection} FROM {identifier(selection.table)} AS t"
             )

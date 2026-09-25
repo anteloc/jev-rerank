@@ -86,6 +86,27 @@ use the JSON form.
 Criteria are part of the score cache key, so editing them re-asks the model.
 With `--json` they are echoed back in a `criteria` object next to `query`.
 
+**Criteria are the lever that matters.** A query whose words carry more than one
+sense is the case the default question cannot settle on its own. Searching 35,257
+LEGO part descriptions for `get me wall decorations` puts
+`Sticker ... X-wing Starfighter ... Wall Pattern` at rank 1 — "wall" in an
+unrelated sense. Rewriting the same search with criteria puts paintings, signs
+and flags in the whole top ten:
+
+```sh
+uv run jev-rerank --db ./parts.db --table-field parts_descriptions.description \
+  --top 10 --query '{
+    "query": "wall decorations",
+    "yes": "the part is a decorative object meant to be displayed on a wall, such as a painting, mirror, poster, picture or tapestry",
+    "no": "the part is not a wall decoration, including any part whose description merely contains the word wall, such as a wall panel or a pattern named wall"
+  }'
+```
+
+Measured over labelled candidates for that query, criteria separated wanted from
+trap results by +0.31, where four different phrasings of the default question all
+managed between +0.03 and +0.09. Spend the effort on criteria, not on rewording
+the query.
+
 ## SQLite records
 
 Use `--db` instead of `--dir` and repeat `--table-field TABLE_NAME.FIELD_NAME` to
@@ -104,21 +125,29 @@ row can appear more than once if different selected fields match. Equal text in
 different records keeps its source identity. Repeating the same selector does not
 duplicate candidates.
 
-Selected columns must have a declared text type such as `TEXT`, `CLOB`, `VARCHAR`,
-`NVARCHAR`, or `CHAR`, following [SQLite's text affinity rules](https://www.sqlite.org/datatype3.html#determination_of_column_affinity).
-Missing tables/columns and columns with numeric, BLOB, or undeclared types are
-rejected before scoring. A type literally named `STRING` has numeric affinity in
-SQLite and is also rejected. Because SQLite can store BLOBs even in text columns,
-stored non-text values are skipped with warnings. NULLs are silently skipped and
-counted in `stats.skipped`; empty strings remain searchable candidates.
+`--table-field` also accepts views. Selected table columns must have a declared
+text type such as `TEXT`, `CLOB`, `VARCHAR`, `NVARCHAR`, or `CHAR`, following
+[SQLite's text affinity rules](https://www.sqlite.org/datatype3.html#determination_of_column_affinity).
+Missing tables/views/columns and table columns with numeric, BLOB, or undeclared
+types are rejected before scoring. A type literally named `STRING` has numeric
+affinity in SQLite and is also rejected. A view column computed from an
+expression (e.g. `a || b`) has no declared type in SQLite even when it always
+yields text, so that check is skipped for views; any non-text value it produces
+is still skipped at read time like any other field. Because SQLite can store
+BLOBs even in text columns, stored non-text values are skipped with warnings.
+NULLs are silently skipped and counted in `stats.skipped`; empty strings remain
+searchable candidates.
 
 The source database is opened read-only, and schema validation and row scans use
 one consistent snapshot. Only the selected fields and record identifiers are read.
 Primary keys, including composite keys in `WITHOUT ROWID` tables, identify records.
 Rows without a usable primary key use an accessible `rowid` alias; tables with
 neither are rejected. Rowids may change after database maintenance, so declared
-primary keys provide more stable identifiers. Selectors accept table/field names
-with spaces or quotes when shell-quoted, but names containing dots are not supported.
+primary keys provide more stable identifiers. Views have no primary key or rowid
+of their own, so their rows are numbered within each scan instead; that number
+shifts when rows are added, removed, or reordered upstream, causing unrelated
+rows to look changed on the next sync. Selectors accept table/field names with
+spaces or quotes when shell-quoted, but names containing dots are not supported.
 
 JSON results contain a `source` object alongside `rank`, `score`, `passage`, and
 a unique `sqlite://...` locator in `path`:
@@ -133,10 +162,10 @@ a unique `sqlite://...` locator in `path`:
 }
 ```
 
-That source metadata, the query, and the selected text passage are included in the
-TypeSafe state. Text output uses the locator as its third column; `--json` provides
-the table, field, and key without needing to parse it. BLOB primary keys are encoded
-as `{"blob_hex": "..."}`.
+That source metadata identifies the result for you; it is **not** sent to TypeSafe,
+which only ever sees the query and the field value itself. Text output uses the
+locator as its third column; `--json` provides the table, field, and key without
+needing to parse it. BLOB primary keys are encoded as `{"blob_hex": "..."}`.
 
 SQLite records use the same chunking, BM25 retrieval, concurrency, and score caching
 as files. Each run streams the selected rows and hashes their values, reindexing
@@ -168,26 +197,28 @@ value; `--candidates 0` scores every passage of every selected text value.
    creates only `--concurrency` tasks, even for millions of passages, and retains
    results in a bounded top-k heap. Cached scores avoid repeated API requests.
 
-Each file-scoring API request has this state:
+Every scoring request carries the query and one block of text, and nothing else:
 
 ```json
 {
   "query": "2025 annual report",
-  "candidate": {
-    "filename": "annual-report-2025.txt",
-    "path": "finance/annual-report-2025.txt",
-    "passage": "...document text...",
-    "passage_index": 0
-  }
+  "text": "annual-report-2025.txt\n\n...document text..."
 }
 ```
 
-One Noul question serves both sources: it generalizes the recipe's Noul to
-“does this candidate text match the search intent?” `candidate.passage` is always
-the text being judged; the remaining fields only say where it came from, either a
-filename and path or a table, field and key. Its default criteria allow
-filename/title/author searches as well as semantic content matches, and
-[query criteria](#query-criteria) replace them. The score is TypeSafe's
+A file's text is its passage prefixed with the filename, because a filename often
+carries a title or author the contents never repeat. A database field value is
+sent on its own. Relative paths, directories, table and field names, record keys
+and the database path never leave your machine.
+
+One Noul question serves both sources: “is the thing `text` describes one of the
+things `query` is asking for?” The judgment rests on the text alone — locators,
+table names and keys identify a result for you, they are not evidence about what
+it means. Its wording follows the
+[jev-1.13 guidance](https://docs.typesafe.ai/model-jaggedness/jev-1.13.md): no
+indirection, `query` stated to be a description rather than an order to carry
+out, and the shared-word traps spelled out in the criteria.
+[Query criteria](#query-criteria) replace those criteria. The score is TypeSafe's
 probability of that yes/no judgment, between 0 and 1, sorted descending. Equal
 scores are ordered by path. These are model judgments, not guaranteed relevance
 measurements.
@@ -202,7 +233,12 @@ overlap and search structures. Application memory does not hold the entire corpu
 or create one task per file; it holds active passages, the shortlist, and top-k
 results. SQLite may use temporary disk space for search operations.
 
-Keyword retrieval can miss semantic matches with different wording. In shortlist
+Keyword retrieval can miss semantic matches with different wording, and on a
+large corpus that, not the judgment, is usually the ceiling. For `wall
+decorations` over those 35,257 part descriptions, BM25 matches only ~105 rows;
+the rest of the 500-value shortlist is filled alphabetically, and parts described
+as `Painting`, `Mirror` or `Poster` are never reached at all, because they share
+no word with the query. Raise `--candidates` when recall matters more than cost. In shortlist
 mode, only one passage per selected file is judged; the rest of that file is not
 sent to TypeSafe. Increase the shortlist or select exhaustive scoring for broader
 coverage:
@@ -256,8 +292,8 @@ corpus directory and passage size. The cache holds document text locally and gro
 with new query/document pairs; removing the cache directory forces a fresh index
 and fresh judgments. A key is required even for a fully cached invocation.
 
-Selected filenames, relative paths, passages, queries, and SQLite source metadata
-are sent to TypeSafe.
+Queries, passages, and the filenames of matching files are sent to TypeSafe.
+Relative paths, directory names, and SQLite source metadata are not.
 Query length and serialized state are bounded to avoid oversized requests; use
 smaller passages if an unusually large state is rejected. No text is silently cut
 to fit the API. A permanent API failure returns exit code 1 without emitting a

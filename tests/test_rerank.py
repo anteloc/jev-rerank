@@ -16,6 +16,7 @@ from jev_rerank.rerank import (
     RerankError,
     Result,
     TopK,
+    question_for,
     rerank,
 )
 
@@ -62,7 +63,7 @@ async def rank(index, client, passages, **kwargs):
     return await rerank(passages, **options)
 
 
-async def test_real_sdk_contract_filename_state_and_cache_invalidation(index):
+async def test_real_sdk_contract_text_state_and_cache_invalidation(index):
     requests = []
 
     def handler(request):
@@ -70,9 +71,12 @@ async def test_real_sdk_contract_filename_state_and_cache_invalidation(index):
         body = json.loads(request.content)
         requests.append(body)
         assert body["questions"]["relevance"]["type"] == "noul"
-        candidate = body["state"]["candidate"]
-        assert candidate["filename"] == "needle.txt"
-        assert candidate["path"] == "folder/needle.txt"
+        # Only the query and the text itself. The filename leads the text; the
+        # "folder/" it sits in is metadata and never reaches the model.
+        # This test varies both query and contents, so pin the shape.
+        assert set(body["state"]) == {"query", "text"}
+        assert body["state"]["text"].startswith("needle.txt\n\n")
+        assert "folder" not in body["state"]["text"]
         return httpx2.Response(200, json=payload(0.9))
 
     passages = [passage("folder/needle.txt")]
@@ -105,7 +109,7 @@ async def test_concurrency_is_bounded_input_is_lazy_and_files_are_unique(index):
         active += 1
         peak = max(peak, active)
         await asyncio.sleep(0.001)
-        i = int(json.loads(request.content)["state"]["candidate"]["passage"])
+        i = int(json.loads(request.content)["state"]["text"].split("\n\n")[1])
         active -= 1
         finished += 1
         return httpx2.Response(200, json=payload(i / 100))
@@ -155,7 +159,7 @@ async def test_failure_cancels_inflight_work_and_preserves_completed_cache(index
     cancelled = asyncio.Event()
 
     async def handler(request):
-        name = json.loads(request.content)["state"]["candidate"]["filename"]
+        name = json.loads(request.content)["state"]["text"].split("\n\n")[0]
         if name == "good.txt":
             return httpx2.Response(200, json=payload(0.8))
         if name == "bad.txt":
@@ -222,21 +226,50 @@ async def test_query_criteria_replace_the_defaults_and_key_the_cache(index):
     assert len({question["instructions"] for question in questions}) == 1
 
 
-async def test_one_question_serves_both_files_and_database_records(index):
+async def test_only_text_reaches_the_model_for_files_and_records(index):
+    """Files are prefixed with their filename; records send the bare value."""
     bodies = []
 
     def handler(request):
         bodies.append(json.loads(request.content))
         return httpx2.Response(200, json=payload(0.5))
 
-    source = {"type": "sqlite", "table": "songs", "field": "lyrics", "key": {"id": 1}}
-    record = Passage("sqlite://songs/lyrics?key=1", "words", 0, "digest", source)
+    source = {
+        "type": "sqlite",
+        "database": "/private/library.db",
+        "table": "songs",
+        "field": "lyrics",
+        "key": {"id": 1},
+    }
+    record = Passage("sqlite://songs/lyrics?key=1", "bare value", 0, "digest", source)
     async with client_for(handler) as client:
-        await rank(index, client, [passage("folder/a.txt"), record])
-    file_body, record_body = sorted(
-        bodies, key=lambda body: "table" in body["state"]["candidate"]
-    )
+        await rank(index, client, [passage("folder/a.txt", "body text"), record])
+    file_body, record_body = sorted(bodies, key=lambda b: b["state"]["text"])
+    assert file_body["state"] == {
+        "query": "find the document",
+        "text": "a.txt\n\nbody text",
+    }
+    assert record_body["state"] == {"query": "find the document", "text": "bare value"}
+    # One question, and no identifier of any kind travels with either request.
     assert file_body["questions"] == record_body["questions"]
-    assert file_body["state"]["candidate"]["filename"] == "a.txt"
-    assert "filename" not in record_body["state"]["candidate"]
-    assert record_body["state"]["candidate"]["table"] == "songs"
+    leaked = ("candidate", "filename", "path", "passage_index", "database", "songs")
+    for body in bodies:
+        serialized = json.dumps(body["state"])
+        assert not any(name in serialized for name in leaked), serialized
+
+
+def test_question_names_its_state_and_keeps_the_guard_under_custom_criteria():
+    """--query criteria replace `criteria`, so essentials must sit in instructions.
+
+    jev-1.13 reads instructions literally and can be steered by hostile candidate
+    text, so the injection guard and the names of the state fields have to
+    survive a caller overriding the criteria.
+    """
+    default = question_for(Query("q"))
+    custom = question_for(Query("q", "yes text", "no text"))
+    assert default["criteria"] == {"true": DEFAULT_YES, "false": DEFAULT_NO}
+    assert custom["criteria"] == {"true": "yes text", "false": "no text"}
+    for question in (default, custom):
+        instructions = question["instructions"]
+        assert "`query`" in instructions and "`text`" in instructions
+        assert "never as instructions" in instructions
