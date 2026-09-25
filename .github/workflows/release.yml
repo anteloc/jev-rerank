@@ -1,0 +1,125 @@
+name: Release
+
+# A release is deliberately started by pushing a version tag, rather than by a
+# normal branch push.  The manual steps (including the one version number that
+# must be changed) live in .github/RELEASE.md.
+on:
+  push:
+    tags:
+      - "v*"
+
+# The default token needs this permission to create the GitHub Release and to
+# upload its assets. Repository/organization policy may still need to allow
+# read/write workflow permissions; see .github/RELEASE.md.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Test, build, and publish
+    runs-on: ubuntu-latest
+    # Test and build with the minimum supported Python version. Keeping this at
+    # the project baseline catches accidental use of newer-only stdlib features.
+    env:
+      UV_PYTHON: "3.11"
+
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Keep the release toolchain on the same uv version that the project was
+      # initially locked and built with. Bump this deliberately in a normal PR.
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.9.3"
+          enable-cache: true
+
+      - name: Install the supported Python version
+        run: uv python install 3.11
+
+      # A tag such as v1.2.3 must exactly match project.version (1.2.3).
+      # This fails before publishing if someone forgot the required version bump
+      # or the corresponding `uv lock` update.
+      - name: Validate the tag and package version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          project_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [[ "$TAG" == "$version" || -z "$version" ]]; then
+            echo "A release tag must look like vX.Y.Z; received: $TAG" >&2
+            exit 1
+          fi
+          if [[ "$version" != "$project_version" ]]; then
+            echo "Tag $TAG implies $version, but pyproject.toml has $project_version." >&2
+            echo "Update project.version and run uv lock before tagging." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install the locked development environment
+        run: uv sync --locked --all-groups
+
+      - name: Lint and test
+        run: |
+          uv run --locked ruff check .
+          uv run --locked pytest
+
+      - name: Build the universal wheel and source distribution
+        run: uv build
+
+      # The normal source distribution intentionally contains only the files
+      # required to build a package. This additional small ZIP also carries
+      # uv.lock, so a user can unzip it and run `uv run --locked --no-dev
+      # jev-rerank` with the dependency set tested for this release.
+      - name: Create the runnable, locked source ZIP
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          root = Path(f"jev-rerank-{version}")
+          output = Path("dist") / f"jev-rerank-{version}-source.zip"
+          files = [Path("LICENSE"), Path("README.md"), Path("pyproject.toml"), Path("uv.lock")]
+          # Do not let bytecode left by a local build inflate an archive. The
+          # checkout is clean in Actions, but this keeps the recipe correct if
+          # it is ever reproduced locally.
+          source_files = [
+              path
+              for path in Path("src").rglob("*")
+              if path.is_file()
+              and "__pycache__" not in path.parts
+              and path.suffix not in {".pyc", ".pyo"}
+          ]
+
+          with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+              for path in [*files, *source_files]:
+                  archive.write(path, root / path)
+          PY
+
+      - name: Write checksums
+        run: |
+          cd dist
+          sha256sum jev_rerank-*.whl jev_rerank-*.tar.gz jev-rerank-*-source.zip > SHA256SUMS.txt
+
+      # `gh` uses the workflow token. `--verify-tag` makes reruns and malformed
+      # release attempts fail safely instead of creating a release for another
+      # commit. GitHub generates the release notes from commits and merged PRs.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --title "jev-rerank $VERSION" \
+            --generate-notes

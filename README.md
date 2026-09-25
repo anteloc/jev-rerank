@@ -8,6 +8,7 @@ can also be searched together in one ranking.
 ## Install and run
 
 Requires Python 3.11+ and SQLite with FTS5 (included in most Python distributions).
+For a checkout, the recommended path is [uv](https://docs.astral.sh/uv/):
 
 ```sh
 uv sync
@@ -24,6 +25,56 @@ jev-rerank --dir ./documents --query 'how to recover a lost account' --top 10
 
 `python -m jev_rerank` works as well. Obtain an API key from the
 [TypeSafe console](https://console.typesafe.ai/).
+
+### Run a GitHub Release download
+
+Every GitHub Release has a small universal wheel and a `source.zip` bundle. The
+bundle is the simplest and most reproducible option: download
+`jev-rerank-X.Y.Z-source.zip` from the [Releases](https://github.com/anteloc/jev-rerank/releases)
+page, extract it, enter the extracted `jev-rerank-X.Y.Z` directory, then run:
+
+```sh
+export TYPESAFE_API_KEY='your-key'
+uv run --locked --no-dev jev-rerank --dir ./documents --query 'how to recover a lost account' --top 10
+```
+
+`uv` is the only required host tool for this route; it can provision a compatible
+Python itself. The archive contains the CLI source and `uv.lock`, not a copy of
+all dependencies, so the download stays small while `--locked` recreates the
+runtime versions tested for that release. This works on Windows, macOS, and
+Linux. In PowerShell, set the key with:
+
+```powershell
+$env:TYPESAFE_API_KEY = 'your-key'
+uv run --locked --no-dev jev-rerank --dir .\documents --query 'how to recover a lost account' --top 10
+```
+
+The wheel is useful when you want a one-command or permanent tool install. Set
+`VERSION` to the release number and use the matching release asset URL:
+
+```sh
+VERSION=X.Y.Z
+WHEEL_URL="https://github.com/anteloc/jev-rerank/releases/download/v${VERSION}/jev_rerank-${VERSION}-py3-none-any.whl"
+
+# One command; uvx is an alias for `uv tool run`.
+uvx --from "$WHEEL_URL" jev-rerank --dir ./documents --query 'how to recover a lost account' --top 10
+
+# Or install it once, then invoke `jev-rerank` normally in later shells.
+uv tool install "$WHEEL_URL"
+```
+
+If you already use [pipx](https://pipx.pypa.io/), it accepts the same wheel URL
+(with a locally installed Python 3.11+):
+
+```sh
+pipx run --spec "$WHEEL_URL" jev-rerank --dir ./documents --query 'how to recover a lost account' --top 10
+pipx install "$WHEEL_URL"
+```
+
+`uvx`/`pipx` resolve the wheel's declared dependencies at install time. Prefer
+the source ZIP when reproducing the release's locked dependency set matters.
+See [the release checklist](.github/RELEASE.md) for the maintainer steps that
+create these assets.
 
 Output is tab-separated `rank`, `score`, and path relative to `--dir`. Progress
 and warnings go to stderr, so stdout can be redirected or piped. Use `--json` for
