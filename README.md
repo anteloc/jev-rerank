@@ -307,19 +307,44 @@ take much longer for a large corpus. Max-passage scoring favors a document with 
 strong local match; it does not assess whole-document constraints or combine facts
 spread across separate passages. Larger passages can help when context matters.
 
+## Self-hosted Laya
+
+[Laya](https://github.com/NandhaKishorM/laya)'s `laya-serve` (Python, or the Rust port)
+answers the same `/v1/systemone` protocol on your own machine. With `--backend laya`,
+the same SDK client talks to it, and no TypeSafe key is needed:
+
+```sh
+jev-rerank --backend laya --dir ./notes --query 'invoices about refunds' --top 5
+```
+
+| Setting | Default with `--backend laya` |
+| --- | --- |
+| `--endpoint` or `LAYA_BASE_URL` | `http://127.0.0.1:8080`; Python `laya-serve` listens on `:8000` unless configured |
+| `--model` or `LAYA_MODEL` | `english`, the checkpoint the server answers with |
+| `LAYA_API_KEY` | unset; sent as the bearer token when the server requires one |
+| `--concurrency` | `4`: `laya-serve` answers one request at a time and by default admits 4 at once; extra requests get 503s that the SDK retries |
+| `--chunk-chars` | `900`: the English checkpoint reads 512 tokens per question and the ranking question takes about 190, so a 4000-character passage would lose most of its text |
+
+`JEV_RERANK_BACKEND=laya` makes Laya the default. `TYPESAFE_*` variables are ignored
+in this mode. Scores are cached per endpoint and model, so the two backends never share
+judgments, and the corpus is indexed separately at the smaller passage size. Rankings
+differ from Jev's: the ranking question's wording was tuned on `jev-1.13`.
+
 ## Options
 
 | Option | Default | Purpose |
 | --- | --- | --- |
+| `--backend` | `typesafe` | `typesafe` (hosted API) or `laya` (see [Self-hosted Laya](#self-hosted-laya)); also accepts `JEV_RERANK_BACKEND` |
+| `--endpoint` | `https://api.typesafe.ai` | API base URL; also accepts `TYPESAFE_BASE_URL` (or `LAYA_BASE_URL` with `--backend laya`) |
 | `--dir` / `--docs` | one source required | Corpus directory; mutually exclusive with `--db` |
 | `--db` | one source required | SQLite database; requires `--table-field` |
 | `--table-field` | required with `--db` | Repeatable `TABLE.FIELD` selector; fields share one ranking |
 | `--query`, `--top` | required | Search intent (see [Query criteria](#query-criteria)) and result count |
 | `--candidates` | `max(500, 10 * top)` | Distinct files or field values to shortlist; `0` scores everything |
-| `--concurrency` | `16` | Maximum simultaneous API calls |
-| `--model` | `jev-1.13.0` | Model ID; also accepts `TYPESAFE_DEFAULT_MODEL` |
+| `--concurrency` | `16` (`4` for Laya) | Maximum simultaneous API calls |
+| `--model` | `jev-1.13.0` (`english` for Laya) | Model ID; also accepts `TYPESAFE_DEFAULT_MODEL` (`LAYA_MODEL` for Laya) |
 | `--cache-dir` | `$XDG_CACHE_HOME/jev-rerank` or `~/.cache/jev-rerank` | Local text index and score cache |
-| `--chunk-chars` | `4000` | Passage size, 256–16000 characters; overlap is 10%, capped at 400 |
+| `--chunk-chars` | `4000` (`900` for Laya) | Passage size, 256–16000 characters; overlap is 10%, capped at 400 |
 | `--timeout` | `60` | SDK request timeout, seconds |
 | `--retries` | `4` | SDK retries for transient failures |
 | `--rebuild` | off | Reindex all source text even if unchanged |
@@ -332,8 +357,8 @@ Use `jev-rerank --help` for the full CLI. The top count must be positive; an exp
 nonzero candidate count must be at least the top count. Fewer results are returned
 if the corpus contains fewer valid files or field values. An empty corpus returns no results.
 
-`TYPESAFE_BASE_URL` overrides the API endpoint; `TYPESAFE_ENDPOINT` is also accepted
-for compatibility with the cookbook. Do not put credentials in the URL.
+`--endpoint` or `TYPESAFE_BASE_URL` overrides the API endpoint; `TYPESAFE_ENDPOINT` is
+also accepted for compatibility with the cookbook. Do not put credentials in the URL.
 
 The model version is pinned so cached results remain meaningful. Score cache keys
 include the query, the question definition with any yes/no criteria, endpoint, model, relative filename/path,
@@ -341,9 +366,11 @@ passage index, and content hash. Model aliases may change remotely; use
 `--no-score-cache` when fresh alias results are needed. Indexes are isolated by
 corpus directory and passage size. The cache holds document text locally and grows
 with new query/document pairs; removing the cache directory forces a fresh index
-and fresh judgments. A key is required even for a fully cached invocation.
+and fresh judgments. With the TypeSafe backend, a key is required even for a fully
+cached invocation.
 
-Queries, passages, and the filenames of matching files are sent to TypeSafe.
+Queries, passages, and the filenames of matching files are sent to the configured
+endpoint: TypeSafe, or your own Laya server.
 Relative paths, directory names, and SQLite source metadata are not.
 Query length and serialized state are bounded to avoid oversized requests; use
 smaller passages if an unusually large state is rejected. No text is silently cut

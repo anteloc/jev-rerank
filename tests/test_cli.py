@@ -415,3 +415,130 @@ def test_default_candidates_scores_medium_corpora_exhaustively():
     assert default_candidates(1) == 500
     assert default_candidates(10) == 500
     assert default_candidates(80) == 800
+
+
+ENV_NAMES = (
+    "TYPESAFE_API_KEY",
+    "TYPESAFE_BASE_URL",
+    "TYPESAFE_ENDPOINT",
+    "TYPESAFE_DEFAULT_MODEL",
+    "JEV_RERANK_BACKEND",
+    "LAYA_BASE_URL",
+    "LAYA_MODEL",
+    "LAYA_API_KEY",
+)
+
+
+def laya_corpus(tmp_path, monkeypatch):
+    """Two files, a clean environment, and a mock laya-serve that records requests."""
+    for name in ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "target.txt").write_text("relevant content")
+    (docs / "other.txt").write_text("unrelated content")
+    seen = {"clients": [], "requests": []}
+
+    def handler(request):
+        body = json.loads(request.content)
+        seen["requests"].append((request, body))
+        score = 0.9 if body["state"]["text"].startswith("target.txt") else 0.2
+        # The full (non-strict) payload laya-serve returns: fields the SDK does not
+        # declare must not break decoding.
+        return httpx2.Response(
+            200,
+            json={
+                "model": "laya-rl-agent",
+                "answers": {
+                    "relevance": {
+                        "type": "noul",
+                        "noul": score,
+                        "confidence": max(score, 1 - score),
+                        "answer_confidence": max(score, 1 - score),
+                        "action": {"act_probability": 1.0},
+                    }
+                },
+                "usage": {
+                    "input_tokens": 300,
+                    "output_tokens": 0,
+                    "state_tokens": 120,
+                    "state_tokens_dropped": 0,
+                    "truncated": False,
+                    "truncated_questions": [],
+                },
+                "routing": {
+                    "model": body.get("model"),
+                    "repo": "convaiinnovations/laya",
+                    "reason": "explicit model",
+                    "detection": None,
+                    "workflow": None,
+                },
+            },
+        )
+
+    def client(**kwargs):
+        seen["clients"].append(kwargs)
+        return AsyncTypeSafeClient(transport=httpx2.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("jev_rerank.cli.AsyncTypeSafeClient", client)
+    args = ["--dir", str(docs), "--query", "target", "--top", "1"]
+    return seen, [*args, "--cache-dir", str(tmp_path / "cache"), "--json"]
+
+
+def test_laya_backend_needs_no_key_and_targets_a_local_server(
+    tmp_path, monkeypatch, capsys
+):
+    seen, args = laya_corpus(tmp_path, monkeypatch)
+    assert main(["--backend", "laya", *args]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["results"][0]["path"] == "target.txt"
+    assert result["model"] == "english"
+    assert result["stats"]["input_tokens"] == 600
+    [client] = seen["clients"]
+    assert client["base_url"] == "http://127.0.0.1:8080"
+    assert client["api_key"] == "laya-no-key"
+    request, body = seen["requests"][0]
+    assert str(request.url) == "http://127.0.0.1:8080/v1/systemone"
+    assert request.headers["authorization"] == "Bearer laya-no-key"
+    assert body["model"] == "english"
+    assert body["questions"]["relevance"]["type"] == "noul"
+
+
+def test_laya_backend_reads_its_own_environment(tmp_path, monkeypatch, capsys):
+    seen, args = laya_corpus(tmp_path, monkeypatch)
+    monkeypatch.setenv("JEV_RERANK_BACKEND", "laya")
+    monkeypatch.setenv("LAYA_BASE_URL", "http://laya.lan:9000/")
+    monkeypatch.setenv("LAYA_MODEL", "typed-decisions")
+    monkeypatch.setenv("LAYA_API_KEY", "server-key")
+    # TypeSafe's settings describe the hosted API and are ignored for Laya.
+    monkeypatch.setenv("TYPESAFE_BASE_URL", "https://api.typesafe.ai")
+    monkeypatch.setenv("TYPESAFE_DEFAULT_MODEL", "jev-1.13.0")
+    assert main(args) == 0
+    capsys.readouterr()
+    [client] = seen["clients"]
+    assert client["base_url"] == "http://laya.lan:9000"
+    assert client["model"] == "typed-decisions"
+    request, body = seen["requests"][0]
+    assert str(request.url) == "http://laya.lan:9000/v1/systemone"
+    assert request.headers["authorization"] == "Bearer server-key"
+    assert body["model"] == "typed-decisions"
+
+
+def test_endpoint_option_overrides_the_environment(tmp_path, monkeypatch, capsys):
+    seen, args = laya_corpus(tmp_path, monkeypatch)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    monkeypatch.setenv("TYPESAFE_BASE_URL", "https://api.typesafe.ai")
+    assert main(["--endpoint", "http://127.0.0.1:8090/", *args]) == 0
+    capsys.readouterr()
+    [client] = seen["clients"]
+    assert client["base_url"] == "http://127.0.0.1:8090"
+    assert client["api_key"] is None
+    assert client["model"] == DEFAULT_MODEL
+
+
+def test_unknown_backend_is_rejected(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("JEV_RERANK_BACKEND", "ollama")
+    with pytest.raises(SystemExit) as exc:
+        main(["--dir", str(tmp_path), "--query", "test", "--top", "1"])
+    assert exc.value.code == 2
+    assert "must be one of typesafe, laya" in capsys.readouterr().err

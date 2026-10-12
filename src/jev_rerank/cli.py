@@ -19,6 +19,25 @@ from .query import parse_query
 from .rerank import DEFAULT_MODEL, RankingStats, RerankError, rerank
 from .sqlite_source import SQLiteSource, parse_table_field
 
+BACKENDS = ("typesafe", "laya")
+TYPESAFE_URL = "https://api.typesafe.ai"
+TYPESAFE_CONCURRENCY = 16
+TYPESAFE_CHUNK_CHARS = 4000
+# A self-hosted laya-serve (Python or Rust) answers the same /v1/systemone protocol,
+# so the SDK talks to it unchanged; only these settings differ.
+LAYA_URL = "http://127.0.0.1:8080"
+LAYA_MODEL = "english"
+# laya-serve runs one forward pass at a time and the stock profiles admit 4 requests;
+# more in flight only collects 503s for the SDK to retry.
+LAYA_CONCURRENCY = 4
+# The English checkpoint reads 512 tokens per question and the ranking question takes
+# about 190 of them. 900 characters is the largest passage measured to fit whole,
+# with its filename and the query, on dense Markdown; plain prose leaves room.
+LAYA_CHUNK_CHARS = 900
+# The SDK always sends a bearer token. laya-serve ignores it unless the server set
+# LAYA_API_KEY, so a keyless server gets this placeholder.
+LAYA_NO_KEY = "laya-no-key"
+
 
 def positive(value: str) -> int:
     number = int(value)
@@ -58,8 +77,22 @@ def cache_directory() -> Path:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Search text files or SQLite fields with BM25 and TypeSafe.",
+        description="Search text files or SQLite fields with BM25 and TypeSafe, "
+        "or a self-hosted Laya server.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    result.add_argument(
+        "--backend",
+        default=os.environ.get("JEV_RERANK_BACKEND") or "typesafe",
+        help="typesafe: the hosted API (needs TYPESAFE_API_KEY); laya: a self-hosted "
+        "laya-serve speaking the same /v1/systemone protocol (no key needed). "
+        "Also accepts JEV_RERANK_BACKEND",
+    )
+    result.add_argument(
+        "--endpoint",
+        default=argparse.SUPPRESS,
+        help="API base URL (default: TYPESAFE_BASE_URL or TYPESAFE_ENDPOINT, else "
+        f"{TYPESAFE_URL}; with --backend laya: LAYA_BASE_URL, else {LAYA_URL})",
     )
     sources = result.add_mutually_exclusive_group(required=True)
     sources.add_argument(
@@ -89,12 +122,18 @@ def parser() -> argparse.ArgumentParser:
         help="Shortlist size (default: max(500, 10 * top)); 0 scores every passage",
     )
     result.add_argument(
-        "--concurrency", type=positive, default=16, help="Maximum in-flight requests"
+        "--concurrency",
+        type=positive,
+        default=argparse.SUPPRESS,
+        help=f"Maximum in-flight requests (default: {TYPESAFE_CONCURRENCY}; "
+        f"{LAYA_CONCURRENCY} with --backend laya)",
     )
     result.add_argument(
         "--model",
-        default=os.environ.get("TYPESAFE_DEFAULT_MODEL") or DEFAULT_MODEL,
-        help="TypeSafe model ID; pin a version for reproducible cached results",
+        default=argparse.SUPPRESS,
+        help="Model ID; pin a version for reproducible cached results (default: "
+        f"TYPESAFE_DEFAULT_MODEL, else {DEFAULT_MODEL}; with --backend laya: "
+        f"LAYA_MODEL, else {LAYA_MODEL})",
     )
     result.add_argument(
         "--cache-dir",
@@ -105,8 +144,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--chunk-chars",
         type=positive,
-        default=4000,
-        help="Characters per passage, with 10%% overlap (maximum 400 characters)",
+        default=argparse.SUPPRESS,
+        help="Characters per passage, with 10%% overlap (maximum 400 characters) "
+        f"(default: {TYPESAFE_CHUNK_CHARS}; {LAYA_CHUNK_CHARS} with --backend laya)",
     )
     result.add_argument(
         "--timeout",
@@ -194,8 +234,9 @@ async def run(args: argparse.Namespace) -> int:
             f"{indexed.removed:,} removed)."
         )
         exhaustive = candidates == 0 or indexed.documents <= candidates
+        scorer = "Laya" if args.backend == "laya" else "TypeSafe"
         if exhaustive:
-            status(f"Scoring all {indexed.passages:,} passages with TypeSafe ...")
+            status(f"Scoring all {indexed.passages:,} passages with {scorer} ...")
         else:
             status(
                 f"Reranking up to {candidates:,} {units} from a BM25 shortlist "
@@ -214,20 +255,12 @@ async def run(args: argparse.Namespace) -> int:
                 last_progress = now
 
         # The SDK handles connection pooling, Retry-After, 429 and 5xx backoff.
-        # TYPESAFE_ENDPOINT is accepted for compatibility with the cookbook.
-        endpoint = (
-            (
-                os.environ.get("TYPESAFE_BASE_URL")
-                or os.environ.get("TYPESAFE_ENDPOINT")
-                or "https://api.typesafe.ai"
-            )
-            .strip()
-            .rstrip("/")
-        )
+        endpoint = args.endpoint
         if not indexed.documents:
             results, ranked = [], RankingStats()
         else:
             async with AsyncTypeSafeClient(
+                api_key=args.api_key,
                 model=args.model,
                 base_url=endpoint,
                 timeout=args.timeout,
@@ -309,6 +342,44 @@ async def run(args: argparse.Namespace) -> int:
             index.close()
 
 
+def apply_backend_defaults(
+    args: argparse.Namespace, argument_parser: argparse.ArgumentParser
+) -> None:
+    """Fill the options whose defaults depend on the backend, and the key to send.
+
+    An option given on the command line always wins; then the backend's own
+    environment variables; then the backend's default.
+    """
+    if args.backend not in BACKENDS:
+        argument_parser.error(
+            f"--backend (or JEV_RERANK_BACKEND) must be one of {', '.join(BACKENDS)}"
+        )
+    laya = args.backend == "laya"
+    # TYPESAFE_ENDPOINT is accepted for compatibility with the cookbook.
+    endpoint = getattr(args, "endpoint", None) or (
+        os.environ.get("LAYA_BASE_URL") or LAYA_URL
+        if laya
+        else os.environ.get("TYPESAFE_BASE_URL")
+        or os.environ.get("TYPESAFE_ENDPOINT")
+        or TYPESAFE_URL
+    )
+    args.endpoint = endpoint.strip().rstrip("/")
+    if not getattr(args, "model", None):
+        args.model = (
+            os.environ.get("LAYA_MODEL") or LAYA_MODEL
+            if laya
+            else os.environ.get("TYPESAFE_DEFAULT_MODEL") or DEFAULT_MODEL
+        )
+    if not hasattr(args, "concurrency"):
+        args.concurrency = LAYA_CONCURRENCY if laya else TYPESAFE_CONCURRENCY
+    if not hasattr(args, "chunk_chars"):
+        args.chunk_chars = LAYA_CHUNK_CHARS if laya else TYPESAFE_CHUNK_CHARS
+    # None lets the SDK read TYPESAFE_API_KEY itself; main() checks it is set.
+    args.api_key = (
+        os.environ.get("LAYA_API_KEY", "").strip() or LAYA_NO_KEY if laya else None
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
@@ -327,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
                 parse_table_field(field)
             except ValueError as exc:
                 argument_parser.error(str(exc))
+    apply_backend_defaults(args, argument_parser)
     # The cap bounds the whole spec, criteria included, before it is parsed.
     if len(args.query.encode()) > 8192:
         argument_parser.error("--query must be at most 8192 UTF-8 bytes")
@@ -340,8 +412,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     if not 256 <= args.chunk_chars <= 16000:
         argument_parser.error("--chunk-chars must be between 256 and 16000")
-    if not os.environ.get("TYPESAFE_API_KEY", "").strip():
-        argument_parser.error("Set TYPESAFE_API_KEY in your environment")
+    typesafe_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    if args.backend == "typesafe" and not typesafe_key:
+        argument_parser.error(
+            "Set TYPESAFE_API_KEY in your environment, "
+            "or use --backend laya for a self-hosted Laya server"
+        )
     try:
         return asyncio.run(run(args))
     except KeyboardInterrupt:
