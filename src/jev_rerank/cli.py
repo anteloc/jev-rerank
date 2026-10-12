@@ -60,13 +60,21 @@ def timeout_value(value: str) -> float:
     return number
 
 
-def default_candidates(top: int) -> int:
+def default_candidates(top: int, laya: bool = False) -> int:
     """Score everything up to a mid-sized corpus; shortlist only beyond it.
 
     A floor well above a few hundred documents keeps small and medium corpora
     fully semantic, which is what a natural-language query usually needs; BM25
     keyword shortlisting only takes over once the corpus is genuinely large.
+
+    A local Laya server is the exception: it answers one passage at a time, about
+    0.2 s each for the ranking question on Apple-silicon Metal and slower on CPU,
+    so the hosted-API floor of 500 costs well over a minute. Batching does not
+    recover it (per-passage time rises with batch size on Metal), so the shortlist
+    is what shrinks: 100 for a top-10 search, about 20 s on Metal.
     """
+    if laya:
+        return max(100, 5 * top)
     return max(500, 10 * top)
 
 
@@ -119,7 +127,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--candidates",
         type=nonnegative,
-        help="Shortlist size (default: max(500, 10 * top)); 0 scores every passage",
+        help="Shortlist size (default: max(500, 10 * top); max(100, 5 * top) with "
+        "--backend laya); 0 scores every passage",
     )
     result.add_argument(
         "--concurrency",
@@ -190,7 +199,7 @@ async def run(args: argparse.Namespace) -> int:
     root = (args.db or args.docs).expanduser().resolve()
     candidates = args.candidates
     if candidates is None:
-        candidates = default_candidates(args.top)
+        candidates = default_candidates(args.top, laya=args.backend == "laya")
     cache_dir = args.cache_dir.expanduser().resolve()
 
     def status(message: str) -> None:

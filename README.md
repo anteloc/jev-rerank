@@ -324,11 +324,23 @@ jev-rerank --backend laya --dir ./notes --query 'invoices about refunds' --top 5
 | `LAYA_API_KEY` | unset; sent as the bearer token when the server requires one |
 | `--concurrency` | `4`: `laya-serve` answers one request at a time and by default admits 4 at once; extra requests get 503s that the SDK retries |
 | `--chunk-chars` | `900`: the English checkpoint reads 512 tokens per question and the ranking question takes about 190, so a 4000-character passage would lose most of its text |
+| `--candidates` | `max(100, 5 * top)`: a local server scores one passage at a time, about 0.2 s each on Apple-silicon Metal, so the hosted floor of 500 would take well over a minute |
 
 `JEV_RERANK_BACKEND=laya` makes Laya the default. `TYPESAFE_*` variables are ignored
 in this mode. Scores are cached per endpoint and model, so the two backends never share
 judgments, and the corpus is indexed separately at the smaller passage size. Rankings
 differ from Jev's: the ranking question's wording was tuned on `jev-1.13`.
+
+Measured on 35,257 LEGO part descriptions with `--top 10` against the Rust server on
+Metal, the default shortlist of 100 takes about 22 s uncached, against about 100 s for
+500. Sending more passages per forward pass does not help there: time per passage rises
+with the batch. Explicit `yes`/`no` criteria matter even more with Laya than with Jev:
+on 52 labelled parts for `wall decorations for castles`, they raised the ranking AUC
+from 0.62 to 0.77 at the same cost per passage. A shorter question was faster (81 ms
+against 209 ms per passage) but did not rank better. The semantic stage only reorders
+the BM25 shortlist, so a wanted item that shares no word with the query (a shield, for
+"wall decorations") is only scored when `--candidates` reaches it, or with
+`--candidates 0`.
 
 ## Options
 
@@ -340,7 +352,7 @@ differ from Jev's: the ranking question's wording was tuned on `jev-1.13`.
 | `--db` | one source required | SQLite database; requires `--table-field` |
 | `--table-field` | required with `--db` | Repeatable `TABLE.FIELD` selector; fields share one ranking |
 | `--query`, `--top` | required | Search intent (see [Query criteria](#query-criteria)) and result count |
-| `--candidates` | `max(500, 10 * top)` | Distinct files or field values to shortlist; `0` scores everything |
+| `--candidates` | `max(500, 10 * top)` (`max(100, 5 * top)` for Laya) | Distinct files or field values to shortlist; `0` scores everything |
 | `--concurrency` | `16` (`4` for Laya) | Maximum simultaneous API calls |
 | `--model` | `jev-1.13.0` (`english` for Laya) | Model ID; also accepts `TYPESAFE_DEFAULT_MODEL` (`LAYA_MODEL` for Laya) |
 | `--cache-dir` | `$XDG_CACHE_HOME/jev-rerank` or `~/.cache/jev-rerank` | Local text index and score cache |

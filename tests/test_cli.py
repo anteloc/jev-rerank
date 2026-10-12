@@ -417,6 +417,12 @@ def test_default_candidates_scores_medium_corpora_exhaustively():
     assert default_candidates(80) == 800
 
 
+def test_laya_shortlists_less_because_it_scores_one_passage_at_a_time():
+    assert default_candidates(1, laya=True) == 100
+    assert default_candidates(10, laya=True) == 100
+    assert default_candidates(40, laya=True) == 200
+
+
 ENV_NAMES = (
     "TYPESAFE_API_KEY",
     "TYPESAFE_BASE_URL",
